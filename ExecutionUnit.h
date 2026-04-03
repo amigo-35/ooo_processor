@@ -91,7 +91,7 @@ public:
          if(!oldest) return; // no instruction is ready
          // compute result and load into pipeline
          bool exc = false;
-         int res = compute(oldest->op, oldest->vj, oldest->vk, oldest->imm, exc);
+        int res = compute(oldest->op, oldest->vj, oldest->vk, oldest->imm, oldest->pc, exc);
  
          free_slot->active     = true;
          free_slot->rob_tag    = oldest->dest_rob;
@@ -121,7 +121,7 @@ public:
         return true;
     }
 private:
-    int compute(OpCode op, int vj, int vk, int imm, bool& exc){
+int compute(OpCode op, int vj, int vk, int imm, int inst_pc, bool& exc){
         exc = false;
         long long result = 0;
 
@@ -152,17 +152,11 @@ private:
  
             // For branches: vj = src1, vk = src2, imm = offset
             // result = actual next PC (current_pc + offset if taken, else current_pc + 1)
-            case OpCode::BEQ:
-                return (vj == vk) ? (imm) : 0; // imm holds offset, 0 = not taken signal
-            case OpCode::BNE:
-                return (vj != vk) ? (imm) : 0;
-            case OpCode::BLT:
-                return (vj <  vk) ? (imm) : 0;
-            case OpCode::BLE:
-                return (vj <= vk) ? (imm) : 0;
-            case OpCode::J:
-                return imm; // always taken
- 
+           case OpCode::BEQ: return (vj == vk) ? (inst_pc + imm) : (inst_pc + 1);
+           case OpCode::BNE: return (vj != vk) ? (inst_pc + imm) : (inst_pc + 1);
+           case OpCode::BLT: return (vj <  vk) ? (inst_pc + imm) : (inst_pc + 1);
+           case OpCode::BLE: return (vj <= vk) ? (inst_pc + imm) : (inst_pc + 1);
+           case OpCode::J:   return inst_pc + imm;
             default:
                 return 0;
         }

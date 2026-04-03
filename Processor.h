@@ -277,11 +277,123 @@ public:
                       lsq->result_is_store, lsq->result_addr, lsq->store_data);
     };
 
-    void stageFetch() {};
+    void stageFetch() {
+        if (fd_reg.valid) return;
+ 
+        if (pc >= (int)inst_memory.size()) return;
 
-    void stageDecode() {};
+        const Instruction& inst = inst_memory[pc];
 
-    void stageExecuteAndBroadcast() {};
+        bool is_branch_or_jump = (inst.op == OpCode::BEQ || inst.op == OpCode::BNE ||
+                                inst.op == OpCode::BLT || inst.op == OpCode::BLE ||
+                                inst.op == OpCode::J);
+        int predicted_next_pc = is_branch_or_jump
+                                ? bp.predict(pc, inst.imm, inst.op)
+                                : pc + 1;
+
+        fd_reg.valid = true;
+        fd_reg.inst  = inst;
+        fd_reg.predicted_pc = predicted_next_pc;
+        pc = predicted_next_pc;
+    };
+
+    void stageDecode() {
+        if (!fd_reg.valid) return;
+
+    const Instruction& inst = fd_reg.inst;
+
+    bool is_j      = (inst.op == OpCode::J);
+    bool is_branch = (inst.op == OpCode::BEQ || inst.op == OpCode::BNE ||
+                      inst.op == OpCode::BLT || inst.op == OpCode::BLE);
+    bool is_lsq    = (inst.op == OpCode::LW || inst.op == OpCode::SW);
+    bool is_store  = (inst.op == OpCode::SW);
+
+
+    ExecutionUnit* unit = (is_j || is_lsq) ? nullptr : getUnitForOp(inst.op);
+
+   
+    if (robFull()) return;  
+
+    if (!is_j) {
+        if (is_lsq  && lsq->isFull())          return;
+        if (!is_lsq && unit && unit->isFull())  return;
+    }
+
+    int rob_tag = robAllocate();
+    ROBEntry& rob = ROB[rob_tag];
+    rob.op           = inst.op;
+    rob.pc           = inst.pc;
+    rob.is_branch    = is_branch || is_j;
+    rob.is_store     = is_store;
+    rob.predicted_pc = fd_reg.predicted_pc;
+
+    
+    bool writes_reg = !is_branch && !is_j && !is_store && (inst.dest > 0);
+    rob.dest_reg = writes_reg ? inst.dest : -1;
+
+    if (is_j) {
+        rob.value = inst.pc + inst.imm;  
+        rob.ready = true;
+        fd_reg.valid = false;
+        global_age++;
+        return;
+    }
+
+    auto readOp = [&](int reg, int& val, int& tag) {
+        if (reg <= 0) { val = 0; tag = -1; return; }  
+        int rat_entry = RAT[reg]; 
+        if (rat_entry == -1) {
+            val = ARF[reg]; tag = -1;          
+        } else if (ROB[rat_entry].ready) {
+            val = ROB[rat_entry].value; tag = -1;     
+        } else {
+            val = 0; tag = rat_entry;                 
+        }
+    };
+
+    int vj, qj, vk, qk;
+    readOp(inst.src1, vj, qj);
+    readOp(inst.src2, vk, qk);
+    if (is_lsq) {
+        LoadStoreQueue::LSQEntry e;
+        e.is_store = is_store;
+        e.base_val = vj; e.qbase = qj; 
+        e.imm      = inst.imm;
+        e.dest_rob = rob_tag;
+        e.pc       = inst.pc;
+        e.age      = global_age++;
+
+        if (is_store) {
+            e.store_val = vk; e.qstore = qk;
+        }
+
+        lsq->tryDispatch(e);
+    }
+    else {
+        RSEntry e;
+        e.busy     = true;
+        e.op       = inst.op;
+        e.vj = vj; e.qj = qj;
+        e.vk = vk; e.qk = qk;
+        e.imm      = inst.imm;
+        e.dest_rob = rob_tag;
+        e.pc       = inst.pc;
+        e.age      = global_age++;
+
+        unit->tryDispatch(e);
+    }
+    if (rob.dest_reg > 0) {
+        RAT[rob.dest_reg] = rob_tag;
+    }
+
+    fd_reg.valid = false;  
+    };
+
+    void stageExecuteAndBroadcast() {
+        for (auto& unit : units) unit.executeCycle();  
+        lsq->executeCycle(Memory);
+        broadcastOnCDB();
+    };
 
     void stageCommit() {};
 
