@@ -277,13 +277,194 @@ public:
                       lsq->result_is_store, lsq->result_addr, lsq->store_data);
     };
 
-    void stageFetch() {};
+    void stageFetch() {
+        // Don't fetch if pipeline register is still occupied
+        // or no more instructions left
+        if (fd_reg.valid) return;
+        if (pc >= (int)inst_memory.size()) return;
+     
+        Instruction& inst = inst_memory[pc];
+     
+        int predicted_pc;
+        if (inst.op == OpCode::J) {
+            predicted_pc = pc + inst.imm;
+        } else if (inst.op == OpCode::BEQ || inst.op == OpCode::BNE ||
+                   inst.op == OpCode::BLT || inst.op == OpCode::BLE) {
+            predicted_pc = bp.predict(pc, inst.imm, inst.op);
+        } else {
+            predicted_pc = pc + 1;
+        }
+     
+        fd_reg.valid        = true;
+        fd_reg.inst         = inst;
+        fd_reg.predicted_pc = predicted_pc;
+     
+        pc = predicted_pc;
+    };
 
-    void stageDecode() {};
+    void stageDecode() {
+        if (!fd_reg.valid) return;
+ 
+        Instruction& inst = fd_reg.inst;
+        ExecutionUnit* unit = getUnitForOp(inst.op);
+     
+        // Stall checks 
+        if (robFull()) return;
+        if (inst.op != OpCode::J) {
+            if (inst.op == OpCode::LW || inst.op == OpCode::SW) {
+                if (lsq->isFull()) return;   // needs LSQ
+            } else if (inst.op != OpCode::J) {
+                if (unit->isFull()) return;  // needs RS
+            }
+            // J needs neither RS nor LSQ, so no stall check needed
+        }
+     
+        // Allocate ROB entry 
+        int rob_tag = robAllocate();
+        ROBEntry& rob = ROB[rob_tag];
+        rob.pc           = inst.pc;
+        rob.op           = inst.op;
+        rob.dest_reg     = inst.dest;
+        rob.predicted_pc = fd_reg.predicted_pc;
+        rob.is_branch    = (inst.op == OpCode::BEQ || inst.op == OpCode::BNE ||
+                            inst.op == OpCode::BLT || inst.op == OpCode::BLE ||
+                            inst.op == OpCode::J);
+        rob.is_store     = (inst.op == OpCode::SW);
+     
+        // J: resolve immediately, no RS needed 
+        if (inst.op == OpCode::J) {
+            rob.value = inst.imm;   
+            rob.ready = true;
+            fd_reg.valid = false;
+            return;
+        }
+     
+        // RAT lookup helper 
+        // Returns {value, tag} for a source register.
+        auto resolve = [&](int reg, int& val, int& tag) {
+            if (reg < 0) { val = 0; tag = -1; return; } // unused operand
+            if (reg == 0) { val = 0; tag = -1; return; } // x0 always 0
+            int rat_tag = RAT[reg];
+            if (rat_tag == -1) {
+                val = ARF[reg]; tag = -1;           // ARF is current
+            } else if (ROB[rat_tag].ready) {
+                val = ROB[rat_tag].value; tag = -1; // ROB has result ready
+            } else {
+                val = 0; tag = rat_tag;             // still waiting
+            }
+        };
+     
+        // Build RS entry 
+        RSEntry rs;
+        rs.op       = inst.op;
+        rs.imm      = inst.imm;
+        rs.dest_rob = rob_tag;
+        rs.pc       = inst.pc;
+        rs.age      = global_age++;
+     
+        resolve(inst.src1, rs.vj, rs.qj);
+        resolve(inst.src2, rs.vk, rs.qk);
+     
+        // SW: src2 is the data register to store
+        // LW: no src2
+        // Branch: src1=reg1, src2=reg2, no dest_reg
+     
+        // Dispatch to correct unit 
+        if (inst.op == OpCode::LW || inst.op == OpCode::SW) {
+            LoadStoreQueue::LSQEntry lsq_entry;
+            lsq_entry.is_store  = (inst.op == OpCode::SW);
+            lsq_entry.imm       = inst.imm;
+            lsq_entry.dest_rob  = rob_tag;
+            lsq_entry.pc        = inst.pc;
+            lsq_entry.age       = rs.age;
+            lsq_entry.base_val  = rs.vj;
+            lsq_entry.qbase     = rs.qj;
+            lsq_entry.store_val = rs.vk;   // for SW: data to store
+            lsq_entry.qstore    = rs.qk;
+            lsq->tryDispatch(lsq_entry);
+        } else {
+            unit->tryDispatch(rs);
+        }
+     
+        // Update RAT 
+        // Only if instruction writes to a register
+        if (inst.dest > 0) {
+            RAT[inst.dest] = rob_tag;
+        }
+     
+        fd_reg.valid = false;
+    };
 
-    void stageExecuteAndBroadcast() {};
+    void stageExecuteAndBroadcast() {
+        // Advance all execution unit pipelines
+        for (auto& unit : units) {
+            unit.executeCycle();
+        }
+     
+        // Advance LSQ
+        lsq->executeCycle(Memory);
+     
+        // Broadcast any completed results on CDB
+        // Updates ROB entries and wakes up waiting RS entries
+        broadcastOnCDB();
+    };
 
-    void stageCommit() {};
+    void stageCommit() {
+     // Nothing to commit if ROB is empty
+    if (rob_count == 0) return;
+ 
+    ROBEntry& entry = ROB[rob_head];
+ 
+    // Head must be valid and ready (finished executing)
+    if (!entry.valid || !entry.ready) return;
+    // CASE 1 — EXCEPTION
+    if (entry.exception) {
+        exception = true;
+        pc        = entry.pc;   // PC of faulting instruction
+        halted    = true;
+        flush();
+        return;                
+    }
+    // CASE 2 — BRANCH
+    if (entry.is_branch) {
+        // entry.value holds the offset if taken, 0 if not taken
+        // (as computed by ExecutionUnit::compute())
+        bool taken       = (entry.value != 0);
+        int  actual_pc   = taken ? (entry.pc + entry.value) : (entry.pc + 1);
+        bool was_correct = (actual_pc == entry.predicted_pc);
+ 
+        // Update 2-bit saturating counter for this branch's PC
+        bp.update(entry.pc, actual_pc, taken, was_correct);
+ 
+        if (!was_correct) {
+            // Misprediction — flush and redirect
+            pc = actual_pc;
+            flush();
+            return;
+        }
+        // Correct prediction — fall through to robFreeHead()
+    }
+    // CASE 3 — STORE (SW)
+    else if (entry.is_store) {
+        // safe to write here
+        Memory[entry.mem_addr] = entry.store_val;
+    }
+    // CASE 4 — NORMAL INSTRUCTION
+    // Write result to architectural register.
+    else {
+        if (entry.dest_reg > 0) {  // skip x0
+            ARF[entry.dest_reg] = entry.value;
+        }
+    }
+    // RAT CLEANUP
+    // Only clear RAT[dest_reg] if this ROB entry
+    // is still the one RAT points to.
+    if (entry.dest_reg > 0 && RAT[entry.dest_reg] == rob_head) {
+        RAT[entry.dest_reg] = -1;
+    }
+    // Free the ROB head slot
+    robFreeHead();
+    };
 
     bool step() {
         if (halted) return false;
