@@ -56,6 +56,7 @@ struct ROBEntry {
     bool is_store = false;
     int mem_addr = -1; // computed memory address for SW
     int store_val = 0; // value to write to memory at commit
+    int age = -1;
 };
 
 struct RSEntry {

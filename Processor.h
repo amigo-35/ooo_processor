@@ -74,7 +74,7 @@ public:
         units.emplace_back(UnitType::ADDER,      config.add_lat,   config.adder_rs_size);
         units.emplace_back(UnitType::MULTIPLIER, config.mul_lat,   config.mult_rs_size);
         units.emplace_back(UnitType::DIVIDER,    config.div_lat,   config.div_rs_size);
-        units.emplace_back(UnitType::BRANCH,     1,                config.br_rs_size);
+        units.emplace_back(UnitType::BRANCH, config.add_lat,   config.br_rs_size);
         units.emplace_back(UnitType::LOGIC,      config.logic_lat, config.logic_rs_size);
 
         lsq = new LoadStoreQueue(config.mem_lat, config.lsq_rs_size);
@@ -327,6 +327,7 @@ public:
                         inst.op == OpCode::BLT || inst.op == OpCode::BLE ||
                         inst.op == OpCode::J);
     rob.is_store     = (inst.op == OpCode::SW);
+    rob.age = global_age;
  
     // ── J: resolve immediately, no RS needed 
     if (inst.op == OpCode::J) {
@@ -400,7 +401,7 @@ public:
     }
  
     // Advance LSQ
-    lsq->executeCycle(Memory);
+    lsq->executeCycle(Memory,ROB);
  
     // Broadcast any completed results on CDB
     // Updates ROB entries and wakes up waiting RS entries
@@ -408,63 +409,44 @@ public:
     };
 
     void stageCommit() {
-     // Nothing to commit if ROB is empty
-    if (rob_count == 0) return;
- 
-    ROBEntry& entry = ROB[rob_head];
- 
-    // Head must be valid and ready (finished executing)
-    if (!entry.valid || !entry.ready) return;
-    // CASE 1 — EXCEPTION
-    if (entry.exception) {
-        exception = true;
-        pc        = entry.pc;   // PC of faulting instruction
-        halted    = true;
-        flush();
-        return;                
-    }
-    // CASE 2 — BRANCH
-    if (entry.is_branch) {
-        int actual_pc;
-        bool taken;
-    
-        if (entry.op == OpCode::J) {
-            actual_pc = entry.value; // value is raw imm for J
-            taken = true;
-        } else {
-            actual_pc = entry.value; // already absolute from ExecutionUnit
-            taken = (actual_pc != entry.pc + 1);
-        }
-    
-        bool was_correct = (actual_pc == entry.predicted_pc);
-        bp.update(entry.pc, actual_pc, taken, was_correct);
-    
-        if (!was_correct) {
-            pc = actual_pc;
+     if (rob_count == 0) return;
+        ROBEntry& head = ROB[rob_head];
+        if (!head.valid || !head.ready) return;
+        if (head.exception) {
+            exception = true;
+            pc = head.pc;
             flush();
             return;
         }
-    }
-    // CASE 3 — STORE (SW)
-    else if (entry.is_store) {
-        // safe to write here
-        Memory[entry.mem_addr] = entry.store_val;
-    }
-    // CASE 4 — NORMAL INSTRUCTION
-    // Write result to architectural register.
-    else {
-        if (entry.dest_reg > 0) {  // skip x0
-            ARF[entry.dest_reg] = entry.value;
+        if (head.is_branch) {
+            int actual_next   = head.value;
+            bool taken        = (actual_next != head.pc + 1);
+            bool was_correct  = (actual_next == head.predicted_pc);
+
+            // Always update predictor at commit (only for real branches, not J)
+            if (head.op != OpCode::J)
+                bp.update(head.pc, actual_next, taken, was_correct);
+
+            if (!was_correct) {
+                pc = actual_next;
+                robFreeHead();   
+                flush();
+                return;
+            }
         }
-    }
-    // RAT CLEANUP
-    // Only clear RAT[dest_reg] if this ROB entry
-    // is still the one RAT points to.
-    if (entry.dest_reg > 0 && RAT[entry.dest_reg] == rob_head) {
-        RAT[entry.dest_reg] = -1;
-    }
-    // Free the ROB head slot
-    robFreeHead();
+
+        if (head.is_store) {
+            Memory[head.mem_addr] = head.store_val;
+        }
+        if (head.dest_reg > 0) {
+            ARF[head.dest_reg] = head.value;
+            // Clear RAT only if no newer in-flight instruction also writes this reg.
+            if (RAT[head.dest_reg] == rob_head)
+                RAT[head.dest_reg] = -1;
+        }
+
+        robFreeHead();
+    
     };
 
     bool step() {
@@ -473,6 +455,7 @@ public:
 
     
         stageCommit();
+        if (exception) return false;
         stageExecuteAndBroadcast();
         stageDecode();
         stageFetch();

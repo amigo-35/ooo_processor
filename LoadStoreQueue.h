@@ -51,7 +51,7 @@ public:
             if (e.qstore == tag) { e.store_val = val; e.qstore = -1; }
         }
     }
-    void executeCycle(std::vector<int>& Memory) {   
+    void executeCycle(std::vector<int>& Memory,const std::vector<ROBEntry>& ROB) {   
         has_result     = false;
         has_exception  = false;
         result_tag     = -1;
@@ -79,7 +79,25 @@ public:
                 if (addr < 0 || addr >= (int)Memory.size()) {
                     exc = true;
                 } else if (!front.is_store) {
-                    val = Memory[addr];
+                   bool forwarded    = false;
+                    int  best_age     = -1;
+                    int  forward_val  = 0;
+                    
+                    for (const auto& rob : ROB) {
+                        if (!rob.valid)       continue;
+                        if (!rob.is_store)    continue;
+                        if (!rob.ready)       continue;   // SW hasn't executed yet
+                        if (rob.age >= front.age) continue; // SW is newer than LW
+                        if (rob.mem_addr != addr) continue;
+                        
+                        // Pick the youngest store older than this load
+                        if (rob.age > best_age) {
+                            best_age    = rob.age;
+                            forward_val = rob.store_val;
+                            forwarded   = true;
+                        }
+                    }
+                    val = forwarded ? forward_val : Memory[addr];
                 }
                 has_result      = true;
                 has_exception   = exc;
