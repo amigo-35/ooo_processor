@@ -50,57 +50,83 @@ public:
         }
     };
     void executeCycle() {
-         // clear previous cycle's result
-         has_result    = false;
-         has_exception = false;
-         result_tag    = -1;
-         result_val    = 0;
-         result_pc     = -1;
-         // advance pipeline , check for completion
-         for(auto& slot : pipeline){
-             if(!slot.active) continue;
-             slot.cycles_left--;
-             if(slot.cycles_left==0){
-                 // Setting for broadcasting
-                 has_result    = true;
-                 has_exception = slot.exception;
-                 result_tag    = slot.rob_tag;
-                 result_val    = slot.result;
-                 result_pc     = slot.pc;
-                 slot.active = false;
-             }
-         }
-         // now pick oldest ready RS instruction and start executing but first find free slot
-         PipelineSlot* free_slot = nullptr;
-         for(auto& slot: pipeline){
-             if(!slot.active){
-                 free_slot = &slot;
-                 break;
-             }
-         } 
-         if(!free_slot) return; // pipeline is full, can't accept
- 
-         RSEntry* oldest = nullptr;
-         for(auto& entry: rs){
-             if(!entry.busy) continue;
-             if(entry.qj !=-1 || entry.qk !=-1) continue;
-             if (!oldest || entry.age < oldest->age) { // lower age means older , we define in this way 
-                 oldest = &entry;
-             }
-         } 
-         if(!oldest) return; // no instruction is ready
-         // compute result and load into pipeline
-         bool exc = false;
-        int res = compute(oldest->op, oldest->vj, oldest->vk, oldest->imm, oldest->pc, exc);
- 
-         free_slot->active     = true;
-         free_slot->rob_tag    = oldest->dest_rob;
-         free_slot->result     = res;
-         free_slot->exception  = exc;
-         free_slot->pc         = oldest->pc;
-         free_slot->cycles_left = latency;
- 
-         oldest->busy = false;
+        // 1. Clear previous cycle's broadcast state
+        has_result    = false;
+        has_exception = false;
+        result_tag    = -1;
+        result_val    = 0;
+        result_pc     = -1;
+
+        // Helper: Check if an instruction is already inside the pipeline
+        auto isExecuting = [&](int rob_tag) {
+            for(auto& slot : pipeline) {
+                if(slot.active && slot.rob_tag == rob_tag) return true;
+            }
+            return false;
+        };
+
+        // 2. DISPATCH: Find a free slot and pull from RS
+        PipelineSlot* free_slot = nullptr;
+        for(auto& slot : pipeline) {
+            if(!slot.active) {
+                free_slot = &slot;
+                break;
+            }
+        } 
+
+        if(free_slot) {
+            RSEntry* oldest = nullptr;
+            for(auto& entry : rs) {
+                if(!entry.busy) continue;
+                
+                // Must be ready AND not already executing in the pipeline
+                if(entry.qj == -1 && entry.qk == -1 && !isExecuting(entry.dest_rob)) { 
+                    if (!oldest || entry.age < oldest->age) {
+                        oldest = &entry;
+                    }
+                }
+            } 
+            
+            if(oldest) {
+                bool exc = false;
+                int res = compute(oldest->op, oldest->vj, oldest->vk, oldest->imm, oldest->pc, exc);
+
+                free_slot->active      = true;
+                free_slot->rob_tag     = oldest->dest_rob;
+                free_slot->result      = res;
+                free_slot->exception   = exc;
+                free_slot->pc          = oldest->pc;
+                free_slot->cycles_left = latency; 
+
+                // DO NOT DEALLOCATE RS HERE! 
+                // It stays busy so Decode correctly stalls if the RS is full.
+            }
+        }
+
+        // 3. EXECUTE: Advance pipeline and broadcast
+        for(auto& slot : pipeline) {
+            if(!slot.active) continue;
+            
+            slot.cycles_left--;
+            
+            if(slot.cycles_left == 0) {
+                has_result    = true;
+                has_exception = slot.exception;
+                result_tag    = slot.rob_tag;
+                result_val    = slot.result;
+                result_pc     = slot.pc;
+                
+                // FREE THE RS ENTRY NOW (At the time of broadcast)
+                for(auto& entry : rs) {
+                    if(entry.busy && entry.dest_rob == slot.rob_tag) {
+                        entry.busy = false;
+                        break;
+                    }
+                }
+                
+                slot.active = false;
+            }
+        }
     };
     // called at decode stage to insert a new entry
     bool tryDispatch(const RSEntry& entry) {

@@ -24,6 +24,7 @@ public:
     std::vector<int> ARF; // regFile
     std::vector<int> Memory; // Memory
     bool exception = false; // exception bit
+    bool just_flushed = false;
 
      struct FetchDecodeReg {
         bool valid       = false;
@@ -242,6 +243,8 @@ public:
         rob_head = rob_tail = rob_count = 0;
 
         std::fill(RAT.begin(), RAT.end(), -1);
+        
+        just_flushed = true; 
     };
 
     void broadcastOnCDB() {
@@ -452,13 +455,18 @@ public:
     bool step() {
         if (halted) return false;
         clock_cycle++;
+        just_flushed = false; // Reset at the start of every cycle
 
-    
         stageCommit();
         if (exception) return false;
+        
         stageExecuteAndBroadcast();
         stageDecode();
-        stageFetch();
+        
+        // ONLY fetch if we didn't just wipe the pipeline this cycle
+        if (!just_flushed) {
+            stageFetch();
+        }
 
         if (exception) return false;
 

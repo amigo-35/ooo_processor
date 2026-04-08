@@ -1,7 +1,9 @@
 import sys
 import re
 
+
 # VALID OPCODES (for validation / reference)
+
 VALID_OPCODES = {
     "add", "sub", "addi", "mul", "div", "rem",
     "lw", "sw",
@@ -10,8 +12,9 @@ VALID_OPCODES = {
     "and", "or", "xor", "andi", "ori", "xori"
 }
 
-def preprocess(filename):    
-    # Read file, strip comments & blanks  
+def preprocess(filename):
+
+    # STEP 1: Read file, strip comments & blanks
     with open(filename, 'r') as f:
         raw_lines = f.readlines()
 
@@ -24,7 +27,8 @@ def preprocess(filename):
         if line:
             clean_lines.append(line)
 
-    # First pass — collect memory labels  
+    # STEP 2: First pass — collect memory labels
+    # .A: 1 2 3  =>  memory_labels["A"] = 0
     memory_labels = {}   # label_name -> starting memory address
     memory_data   = []   # flat list of all values to populate Memory[]
     non_memory_lines = []
@@ -42,8 +46,8 @@ def preprocess(filename):
         else:
             non_memory_lines.append(line)
 
-    
-    # Second pass — collect instruction labels   
+    # STEP 3: Second pass — collect instruction labels
+    # loop:  =>  instruction_labels["loop"] = pc
     instruction_labels = {}   # label_name -> PC value
     instruction_lines  = []   # (original_line, pc) — only real instructions
 
@@ -54,7 +58,10 @@ def preprocess(filename):
         if re.match(r'^\w+\s*:\s*$', line):
             label = line.rstrip(':').strip()
             instruction_labels[label] = pc
+        # Handle "label: instruction" on same line
         elif re.match(r'^\w+\s*:\s*\w+', line):
+            # Check if it's actually a label prefix or a memory op like lw/sw
+            # Split on first colon only if left side is a single word (label)
             parts = line.split(':', 1)
             potential_label = parts[0].strip()
             rest = parts[1].strip() if len(parts) > 1 else ''
@@ -72,16 +79,19 @@ def preprocess(filename):
             instruction_lines.append((line, pc))
             pc += 1
 
-    # Third pass — resolve labels in instructions
+    # STEP 4: Third pass — resolve labels in instructions
+    # Replace memory labels and branch targets with numbers
     resolved_instructions = []
 
     for (line, current_pc) in instruction_lines:
         tokens = line.split()
         opcode = tokens[0].lower()
-        # Memory instructions: lw x1, A(x2)  =>  lw x1, 0(x2)
+
+        # ── Memory instructions: lw x1, A(x2)  =>  lw x1, 0(x2)
         if opcode in ("lw", "sw"):
-            # Rejoin rest of tokens (in case of spaces)
-            rest = ' '.join(tokens[1:])
+            # Rejoin and normalize commas
+            rest = ' '.join(tokens[1:]).replace(',', ' ')
+            rest = ' '.join(rest.split())
             # Match: reg, LABEL(reg) or reg, offset(reg)
             mem_match = re.search(r'([A-Za-z_]\w*)\(', rest)
             if mem_match:
@@ -94,12 +104,12 @@ def preprocess(filename):
                     raise NameError(f"Undefined memory label '{label_name}' in: {line}")
             resolved_instructions.append(f"{opcode} {rest}")
 
-        #Branch instructions: beq x1, x2, loop  =>  beq x1, x2, -1
+        # ── Branch instructions: beq x1, x2, loop  =>  beq x1, x2, -1
         elif opcode in ("beq", "bne", "blt", "ble"):
-            # Format: opcode reg1, reg2, label_or_offset
+            # Handle both "beq x1, x2, loop" and "beq x1 x2 loop"
             rest = ' '.join(tokens[1:])
-            # Split by comma
-            parts = [p.strip() for p in rest.split(',')]
+            # Normalize: remove commas, split on whitespace
+            parts = [p.strip() for p in rest.replace(',', ' ').split()]
             if len(parts) != 3:
                 raise SyntaxError(f"Bad branch instruction: {line}")
             reg1, reg2, target = parts
@@ -119,15 +129,23 @@ def preprocess(filename):
                 offset = instruction_labels[target] - current_pc
                 target = str(offset)
             resolved_instructions.append(f"j {target}")
-        #All other instructions: pass through as-is
+
+        # ── All other instructions: pass through as-is
         else:
             resolved_instructions.append(line)
 
-    #Write output back to same file 
+    # STEP 5: Write output back to same file
+    # Format:
+    #   Line 1..N  = resolved instructions (one per line)
+    # Memory data is embedded as a comment header so
+    # loadProgram() can reconstruct Memory[]
     with open(filename, 'w') as f:
         # Write memory data as a special header line
+        # Format: #MEM val0 val1 val2 ...
+        # Your loadProgram() should look for this line first
         if memory_data:
             f.write("#MEM " + " ".join(map(str, memory_data)) + "\n")
+
         # Write resolved instructions
         for inst in resolved_instructions:
             f.write(inst + "\n")
@@ -138,8 +156,8 @@ def preprocess(filename):
     print(f"  Mem labels   : {list(memory_labels.keys())}")
     print(f"  Inst labels  : {list(instruction_labels.keys())}")
 
-# ENTRY POINT
 
+# ENTRY POINT
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 compiler.py <filename.s>")

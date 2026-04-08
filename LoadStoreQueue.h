@@ -51,66 +51,78 @@ public:
             if (e.qstore == tag) { e.store_val = val; e.qstore = -1; }
         }
     }
-    void executeCycle(std::vector<int>& Memory,const std::vector<ROBEntry>& ROB) {   
-        has_result     = false;
-        has_exception  = false;
-        result_tag     = -1;
-        result_val     = 0;
-        result_addr    = -1;
+    void executeCycle(std::vector<int>& Memory, const std::vector<ROBEntry>& ROB) {  
+        has_result      = false;
+        has_exception   = false;
+        result_tag      = -1;
+        result_val      = 0;
+        result_addr     = -1;
         result_is_store = false;
+
         if (queue.empty()) return;
-        auto& front = queue.front();
-        if (!front.executing) {
-            bool base_ready  = (front.qbase  == -1);
-            bool store_ready = (!front.is_store) || (front.qstore == -1);
 
-            if (base_ready && store_ready) {
-                front.executing    = true;
-                front.cycles_left  = latency;
-                front.computed_addr = front.base_val + front.imm;
-            }
-        } else {
-            front.cycles_left--;
+        // 1. DISPATCH (Start execution sequentially, ONE per cycle)
+        for (auto& entry : queue) {
+            if (!entry.executing) {
+                bool base_ready  = (entry.qbase  == -1);
+                bool store_ready = (!entry.is_store) || (entry.qstore == -1);
 
-            if (front.cycles_left == 0) {
-                int  addr = front.computed_addr;
-                bool exc  = false;
-                int  val  = 0;
-                if (addr < 0 || addr >= (int)Memory.size()) {
-                    exc = true;
-                } else if (!front.is_store) {
-                   bool forwarded    = false;
-                    int  best_age     = -1;
-                    int  forward_val  = 0;
-                    
-                    for (const auto& rob : ROB) {
-                        if (!rob.valid)       continue;
-                        if (!rob.is_store)    continue;
-                        if (!rob.ready)       continue;   // SW hasn't executed yet
-                        if (rob.age >= front.age) continue; // SW is newer than LW
-                        if (rob.mem_addr != addr) continue;
+                // MEMORY DISAMBIGUATION: RAW Hazard Penalty
+                bool forward_penalty = false;
+                if (!entry.is_store && base_ready) {
+                    int addr = entry.base_val + entry.imm;
+                    for (auto it = queue.begin(); it != queue.end(); ++it) {
+                        if (&(*it) == &entry) break; 
                         
-                        // Pick the youngest store older than this load
-                        if (rob.age > best_age) {
-                            best_age    = rob.age;
-                            forward_val = rob.store_val;
-                            forwarded   = true;
+                        if (it->is_store && it->qbase == -1) {
+                            if ((it->base_val + it->imm) == addr) {
+                                forward_penalty = true;
+                                break;
+                            }
                         }
                     }
-                    val = forwarded ? forward_val : Memory[addr];
-                }
-                has_result      = true;
-                has_exception   = exc;
-                result_tag      = front.dest_rob;
-                result_val      = val;
-                result_is_store = front.is_store;
-                result_addr     = addr;
-                if (front.is_store) {
-                    store_data = front.store_val; 
                 }
 
-                queue.pop_front(); 
+                // Only start if dependencies are met
+                if (base_ready && store_ready) {
+                    entry.executing     = true;
+                    entry.cycles_left   = forward_penalty ? latency + 1 : latency; 
+                    entry.computed_addr = entry.base_val + entry.imm;
+                }
+                
+                break; // STRICT: Only ever check/dispatch the oldest waiting instruction
             }
+        }
+
+        // 2. EXECUTE (Advance active operations, but STOP at 0)
+        for (auto& entry : queue) {
+            if (entry.executing && entry.cycles_left > 0) {
+                entry.cycles_left--;
+            }
+        }
+        
+        // 3. BROADCAST & POP (Strictly In-Order, only check the front)
+        auto& front = queue.front();
+        if (front.executing && front.cycles_left == 0) {
+            int addr = front.computed_addr;
+            bool exc = false;
+            int val  = 0;
+
+            if (addr < 0 || addr >= (int)Memory.size()) {
+                exc = true;
+            } else if (!front.is_store) {
+                val = Memory[addr]; 
+            }
+
+            has_result      = true;
+            has_exception   = exc;
+            result_tag      = front.dest_rob;
+            result_val      = val;
+            result_addr     = addr;
+            result_is_store = front.is_store;
+            store_data      = front.store_val; 
+            
+            queue.erase(queue.begin());
         }
     }
 };
